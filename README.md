@@ -1,5 +1,8 @@
 # Markdown to Notion GitHub Action
 
+> Maintained fork by [wawafertility](https://github.com/wawafertility), originally from [parcelLab/markdown-to-notion-action](https://github.com/parcelLab/markdown-to-notion-action).
+
+
 Sync a folder of Markdown files to Notion database items. In Notion, each database item is also a page.
 
 This action:
@@ -50,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Sync markdown to Notion
-        uses: cvscarlos/markdown-to-notion-action@v3
+        uses: wawafertility/markdown-to-notion-action@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           notion_token: ${{ secrets.NOTION_TOKEN }}
