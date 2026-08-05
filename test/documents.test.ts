@@ -72,11 +72,32 @@ test("expandObsidianWikilinks converts wiki targets into markdown links", async 
 
   assert.equal(
     expandObsidianWikilinks("See [[technical-reference]] and [[Home|Vault home]]."),
-    "See [technical-reference](technical-reference.md) and [Vault home](Home.md).",
+    "See [technical-reference](<technical-reference.md>) and [Vault home](<Home.md>).",
+  );
+  assert.equal(
+    expandObsidianWikilinks("See [[Daily Collection Sweep]]."),
+    "See [Daily Collection Sweep](<Daily Collection Sweep.md>).",
   );
   assert.equal(
     expandObsidianWikilinks("Leave [[#heading]] and [[https://example.com]] alone."),
     "Leave [[#heading]] and [[https://example.com]] alone.",
+  );
+});
+
+test("normalizeMarkdownLinkDestinations wraps spaced hrefs for CommonMark parsers", async () => {
+  const { normalizeMarkdownLinkDestinations } = await import("../src/documents.js");
+
+  assert.equal(
+    normalizeMarkdownLinkDestinations("[Daily Collection Sweep](Daily Collection Sweep.md)"),
+    "[Daily Collection Sweep](<Daily Collection Sweep.md>)",
+  );
+  assert.equal(
+    normalizeMarkdownLinkDestinations("[already](<Daily Collection Sweep.md>)"),
+    "[already](<Daily Collection Sweep.md>)",
+  );
+  assert.equal(
+    normalizeMarkdownLinkDestinations("[ok](no-spaces.md)"),
+    "[ok](no-spaces.md)",
   );
 });
 
@@ -134,5 +155,5 @@ async function writeFixture(relativePath: string, content: string): Promise<stri
 }
 
 function hashWithRenderVersion(content: string): string {
-  return createHash("sha256").update("3\0", "utf8").update(content, "utf8").digest("hex");
+  return createHash("sha256").update("4\0", "utf8").update(content, "utf8").digest("hex");
 }

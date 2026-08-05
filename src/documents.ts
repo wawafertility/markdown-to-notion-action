@@ -127,7 +127,9 @@ export async function buildBlocksForDocument(
   githubToken: string | null,
   logContext: LogContext,
 ): Promise<NotionBlock[]> {
-  const markdownBody = expandObsidianWikilinks(documentEntry.body);
+  const markdownBody = normalizeMarkdownLinkDestinations(
+    expandObsidianWikilinks(documentEntry.body),
+  );
   const blocks = markdownToNotionBlocks(markdownBody, {
     logger: (message) => logContext.info(message),
     resolveLink: (href) =>
@@ -171,7 +173,7 @@ function resolveRelativeLink(
   workspaceRoot: string,
   knownPageUrls: Map<string, string>,
 ): string | null {
-  const cleaned = href.split("#", 1)[0].split("?", 1)[0];
+  const cleaned = decodeHrefPath(href.split("#", 1)[0].split("?", 1)[0]);
   if (!cleaned) {
     return null;
   }
@@ -313,7 +315,7 @@ function buildGitHubBlobUrl(absolutePath: string, workspaceRoot: string): string
  * Bump when rendered Notion output changes without the markdown source changing
  * (for example link resolution). Forces a re-sync of unchanged files.
  */
-const CONTENT_RENDER_VERSION = "3";
+const CONTENT_RENDER_VERSION = "4";
 
 function hashMarkdownBody(markdownBody: string): string {
   return createHash("sha256")
@@ -327,9 +329,12 @@ function hashMarkdownBody(markdownBody: string): string {
  * Convert Obsidian-style wikilinks into standard markdown links so they can be
  * resolved to synced Notion pages (or GitHub blob URLs as a fallback).
  *
- * [[technical-reference]] -> [technical-reference](technical-reference.md)
- * [[Home|Vault home]] -> [Vault home](Home.md)
- * [[path/to/note]] -> [path/to/note](path/to/note.md)
+ * Destinations use angle brackets so paths with spaces parse as real links
+ * (CommonMark / @tryfabric/martian treat unquoted spaces as plain text).
+ *
+ * [[technical-reference]] -> [technical-reference](<technical-reference.md>)
+ * [[Home|Vault home]] -> [Vault home](<Home.md>)
+ * [[Daily Collection Sweep]] -> [Daily Collection Sweep](<Daily Collection Sweep.md>)
  */
 export function expandObsidianWikilinks(markdown: string): string {
   return markdown.replace(/\[\[([^\]]+)\]\]/g, (match, rawTarget: string) => {
@@ -344,8 +349,35 @@ export function expandObsidianWikilinks(markdown: string): string {
     const href = withoutAnchor.toLowerCase().endsWith(".md")
       ? withoutAnchor
       : `${withoutAnchor}.md`;
-    return `[${alias}](${href})`;
+    return `[${alias}](<${href}>)`;
   });
+}
+
+/**
+ * Wrap markdown link destinations that contain spaces in <> so martian parses
+ * them as links. Hand-authored vault links often look like [Note](Note Name.md).
+ */
+export function normalizeMarkdownLinkDestinations(markdown: string): string {
+  return markdown.replace(/\[([^\]]*)\]\(([^)\s][^)]*)\)/g, (match, label: string, dest: string) => {
+    const trimmed = dest.trim();
+    if (
+      trimmed.startsWith("<") ||
+      trimmed.startsWith("#") ||
+      /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed) ||
+      !/\s/.test(trimmed)
+    ) {
+      return match;
+    }
+    return `[${label}](<${trimmed}>)`;
+  });
+}
+
+function decodeHrefPath(hrefPath: string): string {
+  try {
+    return decodeURIComponent(hrefPath);
+  } catch {
+    return hrefPath;
+  }
 }
 
 function parseFrontMatter(markdownContent: string): {
