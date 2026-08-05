@@ -80,6 +80,22 @@ test("expandObsidianWikilinks converts wiki targets into markdown links", async 
   );
 });
 
+test("loadMarkdownDocuments ignores invalid YAML frontmatter and still hashes the body", async () => {
+  await resetTestRoot();
+  const docsRoot = path.join(TEST_ROOT, "docs");
+  const filePath = await writeFixture(
+    "docs/broken-frontmatter.md",
+    `---\naliases: [One, *** Broken, Two]\n---\n# Broken Frontmatter\n\nBody`,
+  );
+
+  const [documentEntry] = await loadMarkdownDocuments([filePath], docsRoot, new Map());
+
+  assert.equal(documentEntry.relPath, "broken-frontmatter.md");
+  assert.equal(documentEntry.title, "Broken Frontmatter");
+  assert.deepEqual(documentEntry.attributes, {});
+  assert.equal(documentEntry.sourceHash, hashWithRenderVersion("# Broken Frontmatter\n\nBody"));
+});
+
 async function resetTestRoot(): Promise<void> {
   await rm(TEST_ROOT, { force: true, recursive: true });
   await mkdir(TEST_ROOT, { recursive: true });

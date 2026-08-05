@@ -298,9 +298,16 @@ function parseFrontMatter(markdownContent: string): {
   }
 
   const yamlContent = lines.slice(1, endIndex).join("\n");
-  const parsedYaml = loadYaml(yamlContent);
-  const attributes = isRecord(parsedYaml) ? parsedYaml : {};
-  return { attributes, body: lines.slice(endIndex + 1).join("\n") };
+  const body = lines.slice(endIndex + 1).join("\n");
+  try {
+    const parsedYaml = loadYaml(yamlContent);
+    const attributes = isRecord(parsedYaml) ? parsedYaml : {};
+    return { attributes, body };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    core.warning(`Ignoring invalid YAML frontmatter: ${message}`);
+    return { attributes: {}, body };
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
