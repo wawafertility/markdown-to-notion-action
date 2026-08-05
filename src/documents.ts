@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 import { Client } from "@notionhq/client";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { load as loadYaml } from "js-yaml";
 import * as fs from "node:fs/promises";
 import path from "node:path";
@@ -181,17 +182,17 @@ function resolveRelativeLink(
   } catch {
     return null;
   }
-  if (!isInsidePath(docsRoot, resolvedPath)) {
-    return null;
-  }
-
-  if (!isInsidePath(workspaceRoot, resolvedPath)) {
+  if (!isInsidePath(docsRoot, resolvedPath) || !isInsidePath(workspaceRoot, resolvedPath)) {
     return null;
   }
 
   const extension = path.extname(resolvedPath).toLowerCase();
-  if (extension === ".md") {
-    return knownPageUrls.get(resolvedPath) || buildGitHubBlobUrl(resolvedPath, workspaceRoot);
+  if (extension === ".md" || extension === "") {
+    const markdownPath = extension === "" ? `${resolvedPath}.md` : resolvedPath;
+    return (
+      resolveMarkdownPageUrl(markdownPath, currentFilePath, knownPageUrls) ||
+      (fileExists(markdownPath) ? buildGitHubBlobUrl(markdownPath, workspaceRoot) : null)
+    );
   }
 
   const repoRelativePath = path.relative(workspaceRoot, resolvedPath);
@@ -202,7 +203,71 @@ function resolveRelativeLink(
 
   // PDFs and other binaries: blob URLs work for GitHub users with repo access.
   // raw.githubusercontent.com 404s on private repositories.
-  return buildGitHubBlobUrl(resolvedPath, workspaceRoot);
+  return fileExists(resolvedPath) ? buildGitHubBlobUrl(resolvedPath, workspaceRoot) : null;
+}
+
+/**
+ * Resolve a markdown target the way Obsidian does: exact path first, then unique
+ * basename match across the vault, preferring notes closest to the current file.
+ */
+export function resolveMarkdownPageUrl(
+  resolvedPath: string,
+  currentFilePath: string,
+  knownPageUrls: Map<string, string>,
+): string | null {
+  const direct = knownPageUrls.get(resolvedPath);
+  if (direct) {
+    return direct;
+  }
+
+  const normalizedResolved = resolvedPath.toLowerCase();
+  for (const [absolutePath, pageUrl] of knownPageUrls) {
+    if (absolutePath.toLowerCase() === normalizedResolved) {
+      return pageUrl;
+    }
+  }
+
+  const targetBase = normalizeMarkdownBasename(resolvedPath);
+  const matches: string[] = [];
+  for (const absolutePath of knownPageUrls.keys()) {
+    if (normalizeMarkdownBasename(absolutePath) === targetBase) {
+      matches.push(absolutePath);
+    }
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+  if (matches.length === 1) {
+    return knownPageUrls.get(matches[0]) ?? null;
+  }
+
+  matches.sort((leftPath, rightPath) => {
+    const leftDistance = pathDepthDistance(currentFilePath, leftPath);
+    const rightDistance = pathDepthDistance(currentFilePath, rightPath);
+    if (leftDistance !== rightDistance) {
+      return leftDistance - rightDistance;
+    }
+    return leftPath.length - rightPath.length;
+  });
+  return knownPageUrls.get(matches[0]) ?? null;
+}
+
+function normalizeMarkdownBasename(filePath: string): string {
+  const baseName = path.basename(filePath).toLowerCase();
+  return baseName.endsWith(".md") ? baseName.slice(0, -3) : baseName;
+}
+
+function pathDepthDistance(fromFilePath: string, toFilePath: string): number {
+  const relativePath = path.relative(path.dirname(fromFilePath), path.dirname(toFilePath));
+  if (!relativePath || relativePath === "") {
+    return 0;
+  }
+  return relativePath.split(path.sep).filter((part) => part === "..").length;
+}
+
+function fileExists(filePath: string): boolean {
+  return existsSync(filePath);
 }
 
 function isUploadableImageExtension(extension: string): boolean {
@@ -248,7 +313,7 @@ function buildGitHubBlobUrl(absolutePath: string, workspaceRoot: string): string
  * Bump when rendered Notion output changes without the markdown source changing
  * (for example link resolution). Forces a re-sync of unchanged files.
  */
-const CONTENT_RENDER_VERSION = "2";
+const CONTENT_RENDER_VERSION = "3";
 
 function hashMarkdownBody(markdownBody: string): string {
   return createHash("sha256")

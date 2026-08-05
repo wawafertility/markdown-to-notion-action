@@ -96,6 +96,31 @@ test("loadMarkdownDocuments ignores invalid YAML frontmatter and still hashes th
   assert.equal(documentEntry.sourceHash, hashWithRenderVersion("# Broken Frontmatter\n\nBody"));
 });
 
+test("resolveMarkdownPageUrl finds notes by basename like Obsidian", async () => {
+  const { resolveMarkdownPageUrl } = await import("../src/documents.js");
+  const currentFile = path.join(TEST_ROOT, "adyen/checkout/runbooks/Operating.md");
+  const targetFile = path.join(TEST_ROOT, "adyen/checkout/reference/Daily Collection Sweep.md");
+  const siblingTarget = path.join(TEST_ROOT, "adyen/checkout/runbooks/Flipper Flags.md");
+  const knownPageUrls = new Map<string, string>([
+    [targetFile, "https://www.notion.so/daily"],
+    [siblingTarget, "https://www.notion.so/flipper"],
+    [path.join(TEST_ROOT, "other/Daily Collection Sweep.md"), "https://www.notion.so/other-daily"],
+  ]);
+
+  assert.equal(
+    resolveMarkdownPageUrl(
+      path.join(TEST_ROOT, "adyen/checkout/runbooks/Daily Collection Sweep.md"),
+      currentFile,
+      knownPageUrls,
+    ),
+    "https://www.notion.so/daily",
+  );
+  assert.equal(
+    resolveMarkdownPageUrl(siblingTarget, currentFile, knownPageUrls),
+    "https://www.notion.so/flipper",
+  );
+});
+
 async function resetTestRoot(): Promise<void> {
   await rm(TEST_ROOT, { force: true, recursive: true });
   await mkdir(TEST_ROOT, { recursive: true });
@@ -109,5 +134,5 @@ async function writeFixture(relativePath: string, content: string): Promise<stri
 }
 
 function hashWithRenderVersion(content: string): string {
-  return createHash("sha256").update("2\0", "utf8").update(content, "utf8").digest("hex");
+  return createHash("sha256").update("3\0", "utf8").update(content, "utf8").digest("hex");
 }
