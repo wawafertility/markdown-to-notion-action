@@ -139,8 +139,27 @@ async function syncDatabaseMode(context: RuntimeContext, databaseInput: string):
     documents,
     databaseState.entries,
   );
-  const syncedPages: SyncedPage[] = [];
 
+  // Pass 1: make sure every markdown file has a Notion page id before rendering
+  // content, so relative .md links can resolve to Notion URLs on first sync.
+  for (const documentEntry of documents) {
+    try {
+      await ensureDatabasePageExists(
+        context,
+        databaseState,
+        repo,
+        documentEntry,
+        knownPageUrls,
+      );
+    } catch (error) {
+      core.warning(
+        `Failed to ensure Notion page for ${documentEntry.relPath}: ${describeError(error)}`,
+      );
+    }
+  }
+
+  // Pass 2: render and sync page bodies with a complete path -> Notion URL map.
+  const syncedPages: SyncedPage[] = [];
   for (const documentEntry of documents) {
     try {
       const syncedPage = await syncDocumentToDatabase(
@@ -160,6 +179,62 @@ async function syncDatabaseMode(context: RuntimeContext, databaseInput: string):
 
   const currentDocumentPaths = getCurrentDatabaseDocumentPaths(context, documents);
   await removeStaleSyncStateEntries(context.notion, databaseState.entries, currentDocumentPaths);
+}
+
+async function ensureDatabasePageExists(
+  context: RuntimeContext,
+  databaseState: DatabaseSyncState,
+  repo: string,
+  documentEntry: MarkdownDocument,
+  knownPageUrls: Map<string, string>,
+): Promise<void> {
+  if (knownPageUrls.has(documentEntry.absPath)) {
+    return;
+  }
+
+  const documentPath = getDatabaseDocumentPath(context, documentEntry);
+  const pageTitle = buildNotionPageTitle(documentEntry, context.titlePrefixSeparator);
+  const existingSyncStateEntry = databaseState.entries.get(documentPath);
+  let pageId = existingSyncStateEntry?.pageId ?? documentEntry.notionPageId;
+
+  if (!pageId) {
+    const matchedPageId = databaseState.pageIdsByTitle.get(pageTitle);
+    if (matchedPageId) {
+      pageId = matchedPageId;
+    }
+  }
+
+  if (!pageId) {
+    const documentLog = createLogContext(documentEntry.relPath);
+    const created = await createDataSourcePage(
+      context.notion,
+      databaseState.dataSourceId,
+      buildDatabasePageProperties(
+        databaseState.propertyNames,
+        repo,
+        context.docsFolder,
+        documentPath,
+        pageTitle,
+        undefined,
+      ),
+    );
+    pageId = normalizeNotionId(created.id);
+    documentLog.info(`Created database page shell: ${pageTitle}`);
+    databaseState.entries.set(documentPath, {
+      pageId,
+      title: pageTitle,
+    });
+    knownPageUrls.set(documentEntry.absPath, created.url || notionPageUrl(pageId));
+    return;
+  }
+
+  const normalizedPageId = normalizeNotionId(pageId);
+  databaseState.entries.set(documentPath, {
+    pageId: normalizedPageId,
+    sourceHash: existingSyncStateEntry?.sourceHash,
+    title: existingSyncStateEntry?.title ?? pageTitle,
+  });
+  knownPageUrls.set(documentEntry.absPath, notionPageUrl(normalizedPageId));
 }
 
 async function syncDocumentToDatabase(

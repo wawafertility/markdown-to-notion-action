@@ -126,7 +126,8 @@ export async function buildBlocksForDocument(
   githubToken: string | null,
   logContext: LogContext,
 ): Promise<NotionBlock[]> {
-  const blocks = markdownToNotionBlocks(documentEntry.body, {
+  const markdownBody = expandObsidianWikilinks(documentEntry.body);
+  const blocks = markdownToNotionBlocks(markdownBody, {
     logger: (message) => logContext.info(message),
     resolveLink: (href) =>
       resolveRelativeLink(
@@ -184,16 +185,28 @@ function resolveRelativeLink(
     return null;
   }
 
-  if (path.extname(resolvedPath).toLowerCase() === ".md") {
-    return knownPageUrls.get(resolvedPath) || null;
-  }
-
-  const repoRelativePath = path.relative(workspaceRoot, resolvedPath);
   if (!isInsidePath(workspaceRoot, resolvedPath)) {
     return null;
   }
 
-  return buildGitHubRawUrl(repoRelativePath);
+  const extension = path.extname(resolvedPath).toLowerCase();
+  if (extension === ".md") {
+    return knownPageUrls.get(resolvedPath) || buildGitHubBlobUrl(resolvedPath, workspaceRoot);
+  }
+
+  const repoRelativePath = path.relative(workspaceRoot, resolvedPath);
+  // Images still use raw URLs so the existing Notion file-upload pipeline can fetch them.
+  if (isUploadableImageExtension(extension)) {
+    return buildGitHubRawUrl(repoRelativePath);
+  }
+
+  // PDFs and other binaries: blob URLs work for GitHub users with repo access.
+  // raw.githubusercontent.com 404s on private repositories.
+  return buildGitHubBlobUrl(resolvedPath, workspaceRoot);
+}
+
+function isUploadableImageExtension(extension: string): boolean {
+  return [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"].includes(extension);
 }
 
 function buildGitHubRawUrl(repoRelativePath: string): string | null {
@@ -215,8 +228,59 @@ function buildGitHubRawUrl(repoRelativePath: string): string | null {
   return `${serverUrl}/raw/${ownerRepo}/${reference}/${normalizedPath}`;
 }
 
+function buildGitHubBlobUrl(absolutePath: string, workspaceRoot: string): string | null {
+  const ownerRepo = process.env.GITHUB_REPOSITORY;
+  if (!ownerRepo) {
+    return null;
+  }
+
+  const reference = process.env.GITHUB_SHA || process.env.GITHUB_REF_NAME;
+  if (!reference) {
+    return null;
+  }
+
+  const repoRelativePath = normalizeDocumentPath(path.relative(workspaceRoot, absolutePath));
+  const serverUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
+  return `${serverUrl}/${ownerRepo}/blob/${reference}/${repoRelativePath}`;
+}
+
+/**
+ * Bump when rendered Notion output changes without the markdown source changing
+ * (for example link resolution). Forces a re-sync of unchanged files.
+ */
+const CONTENT_RENDER_VERSION = "2";
+
 function hashMarkdownBody(markdownBody: string): string {
-  return createHash("sha256").update(markdownBody, "utf8").digest("hex");
+  return createHash("sha256")
+    .update(CONTENT_RENDER_VERSION, "utf8")
+    .update("\0", "utf8")
+    .update(markdownBody, "utf8")
+    .digest("hex");
+}
+
+/**
+ * Convert Obsidian-style wikilinks into standard markdown links so they can be
+ * resolved to synced Notion pages (or GitHub blob URLs as a fallback).
+ *
+ * [[technical-reference]] -> [technical-reference](technical-reference.md)
+ * [[Home|Vault home]] -> [Vault home](Home.md)
+ * [[path/to/note]] -> [path/to/note](path/to/note.md)
+ */
+export function expandObsidianWikilinks(markdown: string): string {
+  return markdown.replace(/\[\[([^\]]+)\]\]/g, (match, rawTarget: string) => {
+    const [targetPart, aliasPart] = rawTarget.split("|", 2);
+    const target = targetPart?.trim();
+    if (!target || target.startsWith("#") || target.includes("://")) {
+      return match;
+    }
+
+    const alias = aliasPart?.trim() || target;
+    const withoutAnchor = target.split("#", 1)[0] || target;
+    const href = withoutAnchor.toLowerCase().endsWith(".md")
+      ? withoutAnchor
+      : `${withoutAnchor}.md`;
+    return `[${alias}](${href})`;
+  });
 }
 
 function parseFrontMatter(markdownContent: string): {

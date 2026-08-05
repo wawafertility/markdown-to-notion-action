@@ -55,7 +55,7 @@ test("loadMarkdownDocuments prefers sync state ids and hashes markdown body only
   assert.equal(documentEntry.relPath, "api.md");
   assert.equal(documentEntry.title, "API Guide");
   assert.equal(documentEntry.notionPageId, "6ba23314f3084d8fbd9867b7286c9460");
-  assert.equal(documentEntry.sourceHash, hash("# API Guide\n\nBody"));
+  assert.equal(documentEntry.sourceHash, hashWithRenderVersion("# API Guide\n\nBody"));
 });
 
 test("buildNotionPageTitle prefixes nested document folders", () => {
@@ -65,6 +65,19 @@ test("buildNotionPageTitle prefixes nested document folders", () => {
   } as MarkdownDocument;
 
   assert.equal(buildNotionPageTitle(documentEntry, "→"), "integrations → payments → Adyen Setup");
+});
+
+test("expandObsidianWikilinks converts wiki targets into markdown links", async () => {
+  const { expandObsidianWikilinks } = await import("../src/documents.js");
+
+  assert.equal(
+    expandObsidianWikilinks("See [[technical-reference]] and [[Home|Vault home]]."),
+    "See [technical-reference](technical-reference.md) and [Vault home](Home.md).",
+  );
+  assert.equal(
+    expandObsidianWikilinks("Leave [[#heading]] and [[https://example.com]] alone."),
+    "Leave [[#heading]] and [[https://example.com]] alone.",
+  );
 });
 
 async function resetTestRoot(): Promise<void> {
@@ -79,6 +92,6 @@ async function writeFixture(relativePath: string, content: string): Promise<stri
   return filePath;
 }
 
-function hash(content: string): string {
-  return createHash("sha256").update(content, "utf8").digest("hex");
+function hashWithRenderVersion(content: string): string {
+  return createHash("sha256").update("2\0", "utf8").update(content, "utf8").digest("hex");
 }
