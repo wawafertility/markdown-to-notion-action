@@ -263,7 +263,9 @@ async function syncDocumentToDatabase(
   }
 
   const requiresForcedSync =
-    !existingSyncStateEntry?.sourceHash || existingSyncStateEntry.title !== pageTitle;
+    !existingSyncStateEntry ||
+    existingSyncStateEntry.sourceHash !== documentEntry.sourceHash ||
+    existingSyncStateEntry.title !== pageTitle;
 
   if (pageId) {
     const isUnchanged =
