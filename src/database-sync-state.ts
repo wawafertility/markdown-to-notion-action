@@ -1,6 +1,6 @@
 import type { Client } from "@notionhq/client";
 
-import { normalizeNotionId, notionRequest, toDashedId } from "./notion-api.js";
+import { normalizeNotionId, notionPageUrl, notionRequest, toDashedId } from "./notion-api.js";
 import type { LogContext } from "./logging.js";
 import type { SyncStateEntry } from "./sync-types.js";
 
@@ -57,8 +57,21 @@ type PagePropertyValue = {
   type?: string;
 };
 
+export type DatabasePageCandidate = {
+  createdTime: string | null;
+  pageId: string;
+  sourceHash?: string;
+  title?: string;
+  url: string | null;
+};
+
+export type DuplicateDatabaseRow = DatabasePageCandidate & {
+  path: string;
+};
+
 export type DatabaseSyncState = {
   dataSourceId: string;
+  duplicateRows: DuplicateDatabaseRow[];
   entries: Map<string, SyncStateEntry>;
   pageIdsByTitle: Map<string, string>;
   propertyNames: DatabasePropertyNames;
@@ -101,32 +114,105 @@ export async function loadDatabaseSyncState(
     repo,
     docsFolder,
   );
-  const entries = new Map<string, SyncStateEntry>();
+  const activePages = pages.filter((page) => !isTrashedDatabasePage(page));
   const pageIdsByTitle = collectUniquePageIdsByTitle(
-    pages,
+    activePages,
+    propertyNames,
+    repo,
+    docsFolder,
+    logContext,
+  );
+  const { duplicateRows, entries } = buildPathEntries(
+    activePages,
     propertyNames,
     repo,
     docsFolder,
     logContext,
   );
 
-  for (const page of pages) {
-    const pageInfo = readManagedPageInfo(page, propertyNames);
-    if (!pageInfo || pageInfo.repository !== repo || pageInfo.docsFolder !== docsFolder) {
-      continue;
-    }
-
-    entries.set(pageInfo.path, {
-      pageId: pageInfo.pageId,
-      sourceHash: pageInfo.sourceHash,
-      title: pageInfo.title,
-    });
-  }
-
   logContext.info(
     `Loaded ${entries.size} database sync records from Notion data source ${dataSourceId}.`,
   );
-  return { dataSourceId, entries, pageIdsByTitle, propertyNames };
+  if (duplicateRows.length > 0) {
+    logContext.warn(
+      `Found ${duplicateRows.length} extra Notion row(s) for paths that already have an older row. The oldest row is used for each path.`,
+    );
+  }
+  return { dataSourceId, duplicateRows, entries, pageIdsByTitle, propertyNames };
+}
+
+export async function findCanonicalDatabasePageForPath(
+  notion: Client,
+  dataSourceId: string,
+  propertyNames: DatabasePropertyNames,
+  repo: string,
+  docsFolder: string,
+  documentPath: string,
+): Promise<{ canonical: DatabasePageCandidate; extras: DatabasePageCandidate[] } | null> {
+  const pages = await queryAllDataSourcePages(
+    notion,
+    dataSourceId,
+    propertyNames,
+    repo,
+    docsFolder,
+    documentPath,
+  );
+  const candidates: DatabasePageCandidate[] = [];
+  for (const page of pages) {
+    if (isTrashedDatabasePage(page)) {
+      continue;
+    }
+    const pageInfo = readManagedPageInfo(page, propertyNames);
+    if (
+      !pageInfo ||
+      pageInfo.repository !== repo ||
+      pageInfo.docsFolder !== docsFolder ||
+      pageInfo.path !== documentPath
+    ) {
+      continue;
+    }
+    candidates.push(toDatabasePageCandidate(pageInfo));
+  }
+  if (candidates.length === 0) {
+    return null;
+  }
+  return chooseCanonicalDatabasePage(candidates);
+}
+
+export function formatDuplicatePathWarning(
+  documentPath: string,
+  canonical: DatabasePageCandidate,
+  extras: DatabasePageCandidate[],
+): string {
+  const extraList = extras.map((row) => describeDatabaseRow(row)).join("; ");
+  return `Duplicate Notion rows for path "${documentPath}". Using the oldest row ${describeDatabaseRow(canonical)}. Extra rows: ${extraList}.`;
+}
+
+export function listDuplicateRowsToArchive(
+  entries: Map<string, SyncStateEntry>,
+  duplicateRows: DuplicateDatabaseRow[],
+): DuplicateDatabaseRow[] {
+  const canonicalPageIds = new Set<string>();
+  for (const entry of entries.values()) {
+    canonicalPageIds.add(normalizeNotionId(entry.pageId));
+  }
+
+  const seenPageIds = new Set<string>();
+  const rowsToArchive: DuplicateDatabaseRow[] = [];
+  for (const row of duplicateRows) {
+    let pageId: string;
+    try {
+      pageId = normalizeNotionId(row.pageId);
+    } catch {
+      continue;
+    }
+    if (canonicalPageIds.has(pageId) || seenPageIds.has(pageId)) {
+      continue;
+    }
+    seenPageIds.add(pageId);
+    rowsToArchive.push({ ...row, pageId });
+  }
+  return rowsToArchive;
 }
 
 export function buildDatabasePageProperties(
@@ -434,6 +520,7 @@ async function queryAllDataSourcePages(
   propertyNames: DatabasePropertyNames,
   repo: string,
   docsFolder: string,
+  documentPath?: string,
 ): Promise<DataSourceQueryResult[]> {
   const results: DataSourceQueryResult[] = [];
   let cursor: string | undefined;
@@ -443,7 +530,7 @@ async function queryAllDataSourcePages(
       () =>
         notion.dataSources.query({
           data_source_id: toDashedId(dataSourceId),
-          filter: buildRepositoryScopeFilter(propertyNames, repo, docsFolder),
+          filter: buildRepositoryScopeFilter(propertyNames, repo, docsFolder, documentPath),
           page_size: 100,
           result_type: "page",
           start_cursor: cursor,
@@ -461,19 +548,122 @@ function buildRepositoryScopeFilter(
   propertyNames: DatabasePropertyNames,
   repo: string,
   docsFolder: string,
+  documentPath?: string,
 ): NonNullable<Parameters<Client["dataSources"]["query"]>[0]["filter"]> {
+  const filters: Array<{ property: string; rich_text: { equals: string } }> = [
+    {
+      property: propertyNames.repository,
+      rich_text: { equals: repo },
+    },
+    {
+      property: propertyNames.docsFolder,
+      rich_text: { equals: docsFolder },
+    },
+  ];
+  if (documentPath) {
+    filters.push({
+      property: propertyNames.path,
+      rich_text: { equals: documentPath },
+    });
+  }
+  return { and: filters };
+}
+
+function buildPathEntries(
+  pages: DataSourceQueryResult[],
+  propertyNames: DatabasePropertyNames,
+  repo: string,
+  docsFolder: string,
+  logContext: LogContext,
+): { duplicateRows: DuplicateDatabaseRow[]; entries: Map<string, SyncStateEntry> } {
+  const candidatesByPath = new Map<string, DatabasePageCandidate[]>();
+  for (const page of pages) {
+    const pageInfo = readManagedPageInfo(page, propertyNames);
+    if (!pageInfo || pageInfo.repository !== repo || pageInfo.docsFolder !== docsFolder) {
+      continue;
+    }
+    const candidates = candidatesByPath.get(pageInfo.path) ?? [];
+    candidates.push(toDatabasePageCandidate(pageInfo));
+    candidatesByPath.set(pageInfo.path, candidates);
+  }
+
+  const entries = new Map<string, SyncStateEntry>();
+  const duplicateRows: DuplicateDatabaseRow[] = [];
+  for (const [documentPath, candidates] of candidatesByPath) {
+    const { canonical, extras } = chooseCanonicalDatabasePage(candidates);
+    entries.set(documentPath, {
+      pageId: canonical.pageId,
+      sourceHash: canonical.sourceHash,
+      title: canonical.title,
+    });
+    if (extras.length === 0) {
+      continue;
+    }
+    duplicateRows.push(
+      ...extras.map((extra) => ({
+        ...extra,
+        path: documentPath,
+      })),
+    );
+    logContext.warn(formatDuplicatePathWarning(documentPath, canonical, extras));
+  }
+  return { duplicateRows, entries };
+}
+
+function chooseCanonicalDatabasePage(candidates: DatabasePageCandidate[]): {
+  canonical: DatabasePageCandidate;
+  extras: DatabasePageCandidate[];
+} {
+  const ranked = [...candidates].sort(compareDatabasePageAge);
+  const canonical = ranked[0];
+  if (!canonical) {
+    throw new Error("Cannot choose a canonical Notion row from an empty candidate list.");
+  }
+  return { canonical, extras: ranked.slice(1) };
+}
+
+function compareDatabasePageAge(left: DatabasePageCandidate, right: DatabasePageCandidate): number {
+  const createdTimeDelta = parseCreatedTime(left.createdTime) - parseCreatedTime(right.createdTime);
+  if (createdTimeDelta !== 0) {
+    return createdTimeDelta;
+  }
+  return left.pageId.localeCompare(right.pageId);
+}
+
+function parseCreatedTime(value: string | null): number {
+  if (!value) {
+    return Infinity;
+  }
+  const createdTime = new Date(value).getTime();
+  return Number.isNaN(createdTime) ? Infinity : createdTime;
+}
+
+function toDatabasePageCandidate(pageInfo: {
+  createdTime: string | null;
+  pageId: string;
+  sourceHash?: string;
+  title?: string;
+  url: string | null;
+}): DatabasePageCandidate {
   return {
-    and: [
-      {
-        property: propertyNames.repository,
-        rich_text: { equals: repo },
-      },
-      {
-        property: propertyNames.docsFolder,
-        rich_text: { equals: docsFolder },
-      },
-    ],
+    createdTime: pageInfo.createdTime,
+    pageId: pageInfo.pageId,
+    sourceHash: pageInfo.sourceHash,
+    title: pageInfo.title,
+    url: pageInfo.url ?? notionPageUrl(pageInfo.pageId),
   };
+}
+
+function describeDatabaseRow(row: DatabasePageCandidate): string {
+  const createdTime = row.createdTime ?? "unknown created time";
+  const url = row.url ?? notionPageUrl(row.pageId);
+  return `${row.pageId} (created ${createdTime}, ${url})`;
+}
+
+function isTrashedDatabasePage(page: DataSourceQueryResult): boolean {
+  const isArchived = "archived" in page && page.archived === true;
+  const isInTrash = "in_trash" in page && page.in_trash === true;
+  return isArchived || isInTrash;
 }
 
 function collectUniquePageIdsByTitle(
@@ -521,12 +711,14 @@ function readManagedPageInfo(
   page: DataSourceQueryResult,
   propertyNames: DatabasePropertyNames,
 ): {
+  createdTime: string | null;
   pageId: string;
   docsFolder: string;
   path: string;
   repository: string;
   sourceHash?: string;
   title?: string;
+  url: string | null;
 } | null {
   const pageId = getPageId(page);
   const docsFolder = getRichTextProperty(page, propertyNames.docsFolder);
@@ -537,13 +729,29 @@ function readManagedPageInfo(
   }
 
   return {
+    createdTime: getCreatedTime(page),
     docsFolder,
     pageId,
     path,
     repository: repo,
     sourceHash: getRichTextProperty(page, propertyNames.sourceHash) ?? undefined,
     title: getTitleProperty(page, propertyNames.title) ?? undefined,
+    url: getPageUrl(page),
   };
+}
+
+function getCreatedTime(page: DataSourceQueryResult): string | null {
+  if (!("created_time" in page) || typeof page.created_time !== "string") {
+    return null;
+  }
+  return page.created_time;
+}
+
+function getPageUrl(page: DataSourceQueryResult): string | null {
+  if (!("url" in page) || typeof page.url !== "string" || !page.url) {
+    return null;
+  }
+  return page.url;
 }
 
 function getPageId(page: DataSourceQueryResult): string | null {

@@ -193,7 +193,7 @@ function resolveRelativeLink(
     const markdownPath = extension === "" ? `${resolvedPath}.md` : resolvedPath;
     return (
       resolveMarkdownPageUrl(markdownPath, currentFilePath, knownPageUrls) ||
-      (fileExists(markdownPath) ? buildGitHubBlobUrl(markdownPath, workspaceRoot) : null)
+      (isExistingFile(markdownPath) ? buildGitHubBlobUrl(markdownPath, workspaceRoot) : null)
     );
   }
 
@@ -205,7 +205,7 @@ function resolveRelativeLink(
 
   // PDFs and other binaries: blob URLs work for GitHub users with repo access.
   // raw.githubusercontent.com 404s on private repositories.
-  return fileExists(resolvedPath) ? buildGitHubBlobUrl(resolvedPath, workspaceRoot) : null;
+  return isExistingFile(resolvedPath) ? buildGitHubBlobUrl(resolvedPath, workspaceRoot) : null;
 }
 
 /**
@@ -268,7 +268,7 @@ function pathDepthDistance(fromFilePath: string, toFilePath: string): number {
   return relativePath.split(path.sep).filter((part) => part === "..").length;
 }
 
-function fileExists(filePath: string): boolean {
+function isExistingFile(filePath: string): boolean {
   return existsSync(filePath);
 }
 
@@ -337,7 +337,7 @@ function hashMarkdownBody(markdownBody: string): string {
  * [[Daily Collection Sweep]] -> [Daily Collection Sweep](<Daily Collection Sweep.md>)
  */
 export function expandObsidianWikilinks(markdown: string): string {
-  return markdown.replace(/\[\[([^\]]+)\]\]/g, (match, rawTarget: string) => {
+  return markdown.replaceAll(/\[\[([^\]]+)\]\]/g, (match, rawTarget: string) => {
     const [targetPart, aliasPart] = rawTarget.split("|", 2);
     const target = targetPart?.trim();
     if (!target || target.startsWith("#") || target.includes("://")) {
@@ -358,18 +358,21 @@ export function expandObsidianWikilinks(markdown: string): string {
  * them as links. Hand-authored vault links often look like [Note](Note Name.md).
  */
 export function normalizeMarkdownLinkDestinations(markdown: string): string {
-  return markdown.replace(/\[([^\]]*)\]\(([^)\s][^)]*)\)/g, (match, label: string, dest: string) => {
-    const trimmed = dest.trim();
-    if (
-      trimmed.startsWith("<") ||
-      trimmed.startsWith("#") ||
-      /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed) ||
-      !/\s/.test(trimmed)
-    ) {
-      return match;
-    }
-    return `[${label}](<${trimmed}>)`;
-  });
+  return markdown.replaceAll(
+    /\[([^\]]*)\]\(([^)\s][^)]*)\)/g,
+    (match, label: string, dest: string) => {
+      const trimmed = dest.trim();
+      if (
+        trimmed.startsWith("<") ||
+        trimmed.startsWith("#") ||
+        /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed) ||
+        !/\s/.test(trimmed)
+      ) {
+        return match;
+      }
+      return `[${label}](<${trimmed}>)`;
+    },
+  );
 }
 
 function decodeHrefPath(hrefPath: string): string {

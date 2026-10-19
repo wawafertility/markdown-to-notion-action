@@ -95,10 +95,7 @@ test("normalizeMarkdownLinkDestinations wraps spaced hrefs for CommonMark parser
     normalizeMarkdownLinkDestinations("[already](<Daily Collection Sweep.md>)"),
     "[already](<Daily Collection Sweep.md>)",
   );
-  assert.equal(
-    normalizeMarkdownLinkDestinations("[ok](no-spaces.md)"),
-    "[ok](no-spaces.md)",
-  );
+  assert.equal(normalizeMarkdownLinkDestinations("[ok](no-spaces.md)"), "[ok](no-spaces.md)");
 });
 
 test("loadMarkdownDocuments ignores invalid YAML frontmatter and still hashes the body", async () => {

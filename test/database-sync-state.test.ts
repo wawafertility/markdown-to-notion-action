@@ -3,7 +3,12 @@ import test from "node:test";
 
 import type { Client } from "@notionhq/client";
 
-import { buildDatabasePageProperties, loadDatabaseSyncState } from "../src/database-sync-state.js";
+import {
+  buildDatabasePageProperties,
+  findCanonicalDatabasePageForPath,
+  listDuplicateRowsToArchive,
+  loadDatabaseSyncState,
+} from "../src/database-sync-state.js";
 import type { DatabasePropertyNames } from "../src/database-sync-state.js";
 
 const PROPERTY_NAMES: DatabasePropertyNames = {
@@ -127,21 +132,236 @@ test("loadDatabaseSyncState scopes database rows by repo and docs folder", async
   );
 });
 
+test("loadDatabaseSyncState keeps the oldest live row when a path is duplicated", async () => {
+  const warnings: string[] = [];
+  const notion = createDatabaseStateNotionStub(
+    [],
+    [],
+    [
+      createDatabasePage({
+        createdTime: "2026-09-18T15:42:16.000Z",
+        docsFolder: "docs",
+        pageId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        path: "docs/api.md",
+        repo: "owner/repo",
+        sourceHash: "newer-hash",
+        title: "API",
+        url: "https://www.notion.so/newer",
+      }),
+      createDatabasePage({
+        archived: true,
+        createdTime: "2026-01-01T00:00:00.000Z",
+        docsFolder: "docs",
+        pageId: "cccccccccccccccccccccccccccccccc",
+        path: "docs/api.md",
+        repo: "owner/repo",
+        sourceHash: "archived-hash",
+        title: "API",
+        url: "https://www.notion.so/archived",
+      }),
+      createDatabasePage({
+        createdTime: "2026-08-19T14:19:42.000Z",
+        docsFolder: "docs",
+        pageId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        path: "docs/api.md",
+        repo: "owner/repo",
+        sourceHash: "older-hash",
+        title: "API",
+        url: "https://www.notion.so/older",
+      }),
+    ],
+  );
+
+  const state = await loadDatabaseSyncState(notion, NOTION_DATABASE_ID, "owner/repo", "docs", {
+    info: () => {},
+    warn: (message) => {
+      warnings.push(message);
+    },
+  });
+
+  assert.deepEqual(state.entries.get("docs/api.md"), {
+    pageId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    sourceHash: "older-hash",
+    title: "API",
+  });
+  assert.equal(state.duplicateRows.length, 1);
+  assert.equal(state.duplicateRows[0]?.pageId, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  assert.match(warnings.join("\n"), /bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/);
+  assert.match(warnings.join("\n"), /https:\/\/www\.notion\.so\/newer/);
+  assert.equal(
+    warnings.some((message) => message.includes("cccccccccccccccccccccccccccccccc")),
+    false,
+  );
+});
+
+test("loadDatabaseSyncState breaks duplicate created_time ties by page id", async () => {
+  const notion = createDatabaseStateNotionStub(
+    [],
+    [],
+    [
+      createDatabasePage({
+        createdTime: "2026-08-19T14:19:42.000Z",
+        docsFolder: "docs",
+        pageId: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        path: "docs/api.md",
+        repo: "owner/repo",
+        sourceHash: "hash-e",
+        title: "API",
+      }),
+      createDatabasePage({
+        createdTime: "2026-08-19T14:19:42.000Z",
+        docsFolder: "docs",
+        pageId: "dddddddddddddddddddddddddddddddd",
+        path: "docs/api.md",
+        repo: "owner/repo",
+        sourceHash: "hash-d",
+        title: "API",
+      }),
+    ],
+  );
+
+  const state = await loadDatabaseSyncState(notion, NOTION_DATABASE_ID, "owner/repo", "docs", {
+    info: () => {},
+    warn: () => {},
+  });
+
+  assert.equal(state.entries.get("docs/api.md")?.pageId, "dddddddddddddddddddddddddddddddd");
+  assert.equal(state.duplicateRows[0]?.pageId, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+});
+
+test("findCanonicalDatabasePageForPath queries one path and returns the oldest row", async () => {
+  const queryRequests: Array<Parameters<Client["dataSources"]["query"]>[0]> = [];
+  const notion = {
+    dataSources: {
+      query: async (request: Parameters<Client["dataSources"]["query"]>[0]) => {
+        queryRequests.push(request);
+        return {
+          has_more: false,
+          next_cursor: null,
+          results: [
+            createDatabasePage({
+              createdTime: "2026-09-18T15:42:16.000Z",
+              docsFolder: "docs",
+              pageId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              path: "docs/api.md",
+              repo: "owner/repo",
+              sourceHash: "newer-hash",
+              title: "API",
+              url: "https://www.notion.so/newer",
+            }),
+            createDatabasePage({
+              createdTime: "2026-08-19T14:19:42.000Z",
+              docsFolder: "docs",
+              inTrash: true,
+              pageId: "cccccccccccccccccccccccccccccccc",
+              path: "docs/api.md",
+              repo: "owner/repo",
+              sourceHash: "trashed-hash",
+              title: "API",
+            }),
+            createDatabasePage({
+              createdTime: "2026-08-19T14:19:42.000Z",
+              docsFolder: "docs",
+              pageId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              path: "docs/other.md",
+              repo: "owner/repo",
+              sourceHash: "other-hash",
+              title: "Other",
+            }),
+            createDatabasePage({
+              createdTime: "2026-08-19T14:19:42.000Z",
+              docsFolder: "docs",
+              pageId: "dddddddddddddddddddddddddddddddd",
+              path: "docs/api.md",
+              repo: "owner/repo",
+              sourceHash: "older-hash",
+              title: "API",
+              url: "https://www.notion.so/older",
+            }),
+          ],
+        };
+      },
+    },
+  } as unknown as Client;
+
+  const found = await findCanonicalDatabasePageForPath(
+    notion,
+    NOTION_DATA_SOURCE_ID,
+    PROPERTY_NAMES,
+    "owner/repo",
+    "docs",
+    "docs/api.md",
+  );
+
+  assert.equal(found?.canonical.pageId, "dddddddddddddddddddddddddddddddd");
+  assert.equal(found?.canonical.sourceHash, "older-hash");
+  assert.deepEqual(
+    found?.extras.map((extra) => extra.pageId),
+    ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+  );
+  assert.deepEqual(queryRequests[0]?.filter, {
+    and: [
+      { property: "Repository", rich_text: { equals: "owner/repo" } },
+      { property: "Docs Folder", rich_text: { equals: "docs" } },
+      { property: "Path", rich_text: { equals: "docs/api.md" } },
+    ],
+  });
+});
+
+test("listDuplicateRowsToArchive skips the canonical page and repeated extras", () => {
+  const rows = listDuplicateRowsToArchive(
+    new Map([["docs/api.md", { pageId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" }]]),
+    [
+      {
+        createdTime: "2026-09-18T15:42:16.000Z",
+        pageId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        path: "docs/api.md",
+        url: "https://www.notion.so/newer",
+      },
+      {
+        createdTime: "2026-08-19T14:19:42.000Z",
+        pageId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        path: "docs/api.md",
+        url: "https://www.notion.so/older",
+      },
+      {
+        createdTime: "2026-09-18T15:42:16.000Z",
+        pageId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        path: "docs/api.md",
+        url: "https://www.notion.so/newer",
+      },
+    ],
+  );
+
+  assert.deepEqual(
+    rows.map((row) => row.pageId),
+    ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+  );
+});
+
 const NOTION_DATABASE_ID = "3a3c37dcb4c480d2ac6df52801c367c3";
 const NOTION_DATA_SOURCE_ID = "3a3c37dcb4c480d9acc4000bd6c6d46f";
 const NOTION_VIEW_ID = "3a3c37dcb4c480f1a72e000c76faf235";
 
 function createDatabasePage(input: {
+  archived?: boolean;
+  createdTime?: string;
   docsFolder: string;
+  inTrash?: boolean;
   pageId: string;
   path: string;
   repo: string;
   sourceHash: string;
   title: string;
+  url?: string;
 }): Record<string, unknown> {
   return {
+    archived: input.archived ?? false,
+    created_time: input.createdTime,
     id: input.pageId,
+    in_trash: input.inTrash ?? false,
     object: "page",
+    url: input.url,
     properties: {
       Name: { title: [{ plain_text: input.title }], type: "title" },
       "Docs Folder": richTextProperty(input.docsFolder),

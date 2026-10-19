@@ -55,6 +55,11 @@ inputs:
     description: "GitHub token used to read private repository files and file commit timestamps"
     required: false
 
+  archive_duplicate_pages:
+    description: "Archive extra Notion database rows that share the same Repository, Docs Folder, and Path. The oldest row is kept. Default false."
+    required: false
+    default: "false"
+
 runs:
   using: "composite"
   steps:
@@ -84,3 +89,4 @@ runs:
         INPUT_EXCLUDE_GLOBS: ${{ inputs.exclude_globs }}
         INPUT_TITLE_PREFIX_SEPARATOR: ${{ inputs.title_prefix_separator }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
+        INPUT_ARCHIVE_DUPLICATE_PAGES: ${{ inputs.archive_duplicate_pages }}

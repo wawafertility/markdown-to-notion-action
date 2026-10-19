@@ -3,9 +3,12 @@ import type { Client } from "@notionhq/client";
 import { syncPageBlocks } from "./block-sync.js";
 import { getLastCommitTime } from "./git-utils.js";
 import { defaultLogContext } from "./logging.js";
+import { describeError } from "./logging.js";
 import {
   isNotionArchivedError,
+  isNotionBlockArchivedError,
   isNotionNotFoundError,
+  isTransientNotionError,
   normalizeNotionId,
   notionRequest,
   toDashedId,
@@ -172,6 +175,94 @@ export async function updateDataSourcePageProperties(
   );
 }
 
+async function isNotionPageGone(notion: Client, pageId: string): Promise<boolean> {
+  try {
+    const page = await notionRequest(
+      () => notion.pages.retrieve({ page_id: toDashedId(pageId) }),
+      `pages.retrieve ${pageId}`,
+    );
+    return isArchivedOrTrashedPage(page);
+  } catch (error) {
+    if (isNotionNotFoundError(error)) {
+      return true;
+    }
+    throw error;
+  }
+}
+
+export async function updateNotionPageWithRecovery(
+  notion: Client,
+  pageId: string,
+  pageTitle: string,
+  logContext: LogContext,
+  update: () => Promise<void>,
+): Promise<"recreate" | "updated"> {
+  try {
+    await update();
+    return "updated";
+  } catch (error) {
+    const decision = await classifyPageUpdateFailure(notion, pageId, error, logContext);
+    if (decision === "recreate") {
+      return "recreate";
+    }
+    if (decision !== "retry") {
+      throw error;
+    }
+
+    logContext.warn(
+      `Retrying Notion update for ${pageTitle} after a block-level or transient error: ${describeError(error)}`,
+    );
+    try {
+      await update();
+      return "updated";
+    } catch (retryError) {
+      const retryDecision = await classifyPageUpdateFailure(notion, pageId, retryError, logContext);
+      if (retryDecision === "recreate") {
+        return "recreate";
+      }
+      throw retryError;
+    }
+  }
+}
+
+async function classifyPageUpdateFailure(
+  notion: Client,
+  pageId: string,
+  error: unknown,
+  logContext: LogContext,
+): Promise<"recreate" | "retry" | "throw"> {
+  try {
+    if (await isNotionPageGone(notion, pageId)) {
+      return "recreate";
+    }
+  } catch (retrieveError) {
+    logContext.warn(
+      `Unable to confirm whether Notion page ${pageId} still exists: ${describeError(retrieveError)}`,
+    );
+    return "throw";
+  }
+
+  if (isRetryablePageUpdateError(error)) {
+    return "retry";
+  }
+  return "throw";
+}
+
+function isRetryablePageUpdateError(error: unknown): boolean {
+  return (
+    isNotionBlockArchivedError(error) ||
+    isNotionArchivedError(error) ||
+    isNotionNotFoundError(error) ||
+    isTransientNotionError(error)
+  );
+}
+
+function isArchivedOrTrashedPage(page: object): boolean {
+  const isArchived = "archived" in page && page.archived === true;
+  const isInTrash = "in_trash" in page && page.in_trash === true;
+  return isArchived || isInTrash;
+}
+
 export async function getSyncDecision(
   notion: Client,
   pageId: string,
@@ -198,7 +289,7 @@ export async function getSyncDecision(
     throw error;
   }
 
-  if (("archived" in page && page.archived) || ("in_trash" in page && page.in_trash)) {
+  if (isArchivedOrTrashedPage(page)) {
     return { archivedOrMissing: true, skipSync: false };
   }
   if (!lastCommitTime) {
