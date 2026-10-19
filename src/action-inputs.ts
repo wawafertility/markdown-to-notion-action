@@ -22,6 +22,20 @@ export function normalizeTitlePrefixSeparator(value: string): string {
   return trimmed;
 }
 
+export function isInputEnabled(value: string, isEnabledWhenBlank = false): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return isEnabledWhenBlank;
+  }
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return isEnabledWhenBlank;
+}
+
 export function normalizePrivateMarkdownPrefix(value: string): string | null {
   const normalized = value.trim();
   if (!normalized) {

@@ -26,10 +26,10 @@ Flow:
 2. `loadDatabaseSyncState()` in `src/database-sync-state.ts` resolves the provided Notion database ID to its first data source.
 3. Required database properties are created if missing: `Name`, `Repository`, `Docs Folder`, `Path`, `Source Hash`, and `Last Synced At`.
 4. Table views are updated to hide `Source Hash`; visibility for all other columns is left unchanged.
-5. Database pages are queried once with pagination using a Notion filter scoped by `Repository` and `Docs Folder`, then converted into an in-memory path-to-page map.
+5. Database pages are queried once with pagination using a Notion filter scoped by `Repository` and `Docs Folder`, then converted into an in-memory path-to-page map. When several live rows share a path, the oldest `created_time` is canonical and the extras are logged. `archive_duplicate_pages` (default false) archives only those extras.
 6. Markdown files are collected from `docs_folder`, excluding private Markdown files whose file name starts with `private_markdown_prefix` (`_` by default) and paths matching `exclude_globs`.
 7. Each document is skipped when its `Source Hash` matches the current Markdown body hash and the title still matches.
-8. New database items are created before page block upload starts, so later workflow runs can find the item even if the previous run fails mid-upload.
+8. New database items are created before page block upload starts, so later workflow runs can find the item even if the previous run fails mid-upload. Creation re-queries that path first and again immediately after insert; the oldest row wins, and a row this run just created is archived if an older row exists. Page updates are recreated only when the page itself is archived, in trash, or not found. `Can't edit block that is archived` is a child-block failure: the block sync appends a replacement, then the page update is retried once and surfaced if the page is still live.
 9. Stale database records in the current `Repository` and `Docs Folder` scope whose `Path` no longer exists in Git are archived in Notion.
 
 Critical fields:

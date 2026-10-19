@@ -6,6 +6,7 @@ import {
   type BlockUpdateRequest,
   type CalloutIconRequest,
   type PartialBlockObjectResponse,
+  isNotionBlockArchivedError,
   isNotionNotFoundError,
   listAllChildren,
   normalizeNotionId,
@@ -114,7 +115,7 @@ export async function syncPageBlocks(
     }
 
     const incoming = blocks[index];
-    const result = await syncBlockPair(notion, pageId, existing, incoming, logContext);
+    const result = await syncBlockPair(notion, pageId, existing, incoming, logContext, lastBlockId);
     switch (result.action) {
       case "unchanged": {
         stats.unchanged += 1;
@@ -282,6 +283,7 @@ async function syncBlockPair(
   existing: PartialBlockObjectResponse,
   incoming: NotionBlock,
   logContext: LogContext,
+  afterBlockId: string | null,
 ): Promise<BlockSyncResult> {
   const existingId = getBlockId(existing);
   const existingType = getBlockType(existing);
@@ -289,6 +291,43 @@ async function syncBlockPair(
     return { action: "unchanged" };
   }
 
+  try {
+    return await syncLiveBlockPair(
+      notion,
+      parentPageId,
+      existing,
+      existingId,
+      existingType,
+      incoming,
+      logContext,
+    );
+  } catch (error) {
+    if (!isNotionBlockArchivedError(error)) {
+      throw error;
+    }
+    logContext.warn(
+      `Block ${existingId} is archived. Appending a replacement without recreating the page.`,
+    );
+    const newBlockId = await appendReplacementForArchivedBlock(
+      notion,
+      parentPageId,
+      afterBlockId,
+      incoming,
+      logContext,
+    );
+    return { action: "replaced", newBlockId };
+  }
+}
+
+async function syncLiveBlockPair(
+  notion: Client,
+  parentPageId: string,
+  existing: PartialBlockObjectResponse,
+  existingId: string,
+  existingType: string,
+  incoming: NotionBlock,
+  logContext: LogContext,
+): Promise<BlockSyncResult> {
   const incomingChildren = getBlockChildren(incoming);
   const hasExistingChildren = hasExistingBlockChildren(existing);
   const hasChildrenToSync = incomingChildren.length > 0 || hasExistingChildren;
@@ -381,7 +420,7 @@ async function updateBlockContent(
     await notionRequest(() => notion.blocks.update(request), `blocks.update ${blockId}`);
     return true;
   } catch (error) {
-    if (isNotionNotFoundError(error)) {
+    if (isNotionNotFoundError(error) || isNotionBlockArchivedError(error)) {
       throw error;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -521,20 +560,47 @@ function buildBlockUpdateRequest(blockId: string, block: NotionBlock): BlockUpda
   }
 }
 
-async function appendSingleBlockAfter(
+async function appendReplacementForArchivedBlock(
   notion: Client,
   parentPageId: string,
-  anchorBlockId: string,
+  afterBlockId: string | null,
   block: NotionBlock,
   logContext: LogContext,
 ): Promise<string> {
-  logContext.info(`Starting single block creation after ${anchorBlockId}.`);
+  if (afterBlockId) {
+    try {
+      return await appendSingleBlockAfter(notion, parentPageId, afterBlockId, block, logContext);
+    } catch (error) {
+      if (!isNotionBlockArchivedError(error)) {
+        throw error;
+      }
+      logContext.warn(
+        `Anchor block ${afterBlockId} is archived. Appending the replacement at the end of the page.`,
+      );
+    }
+  }
+
+  return appendSingleBlockAfter(notion, parentPageId, null, block, logContext);
+}
+
+async function appendSingleBlockAfter(
+  notion: Client,
+  parentPageId: string,
+  anchorBlockId: string | null,
+  block: NotionBlock,
+  logContext: LogContext,
+): Promise<string> {
+  logContext.info(
+    anchorBlockId
+      ? `Starting single block creation after ${anchorBlockId}.`
+      : `Starting single block creation on ${parentPageId}.`,
+  );
   const response = await notionRequest(
     () =>
       notion.blocks.children.append({
         block_id: toDashedId(parentPageId),
         children: toNotionBlockRequests([block]),
-        after: toDashedId(anchorBlockId),
+        ...(anchorBlockId && { after: toDashedId(anchorBlockId) }),
       }),
     `blocks.children.append ${parentPageId}`,
   );
@@ -589,7 +655,8 @@ async function deleteBlockSafe(
       `blocks.delete ${blockId}`,
     );
   } catch (error) {
-    if (isNotionNotFoundError(error)) {
+    if (isNotionNotFoundError(error) || isNotionBlockArchivedError(error)) {
+      logContext.info(`Block ${blockId} is already missing or archived.`);
       return;
     }
     const message = error instanceof Error ? error.message : String(error);

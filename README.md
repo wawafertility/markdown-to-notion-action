@@ -2,7 +2,6 @@
 
 > Maintained fork by [wawafertility](https://github.com/wawafertility), originally from [parcelLab/markdown-to-notion-action](https://github.com/parcelLab/markdown-to-notion-action).
 
-
 Sync a folder of Markdown files to Notion database items. In Notion, each database item is also a page.
 
 This action:
@@ -69,6 +68,8 @@ jobs:
             docs/**/*.draft.md
           # Optional: separator used between folder names and title (default: →)
           title_prefix_separator: "→"
+          # Optional: archive newer duplicate rows for the same path (default: false)
+          archive_duplicate_pages: "false"
 ```
 
 ## Inputs
@@ -84,6 +85,7 @@ jobs:
 | `exclude_globs`           | No       | Newline-separated glob patterns to exclude, relative to the repository root.                                                              |
 | `title_prefix_separator`  | No       | Separator used between folder names and the title. Default: `→`.                                                                          |
 | `github_token`            | No       | Used to read private GitHub repository files for image uploads and file commit timestamps.                                                |
+| `archive_duplicate_pages` | No       | Archive extra database rows that share the same `Repository`, `Docs Folder`, and `Path`, after keeping the oldest row. Default: `false`.  |
 
 **Requirement:** Provide `database_id` for database-backed sync, or provide `page_block_id`/`page_id` for the legacy parent-page mode.
 
@@ -108,7 +110,9 @@ The action hides `Source Hash` in table views when the Notion API allows updatin
 
 On each run, the action queries only database rows whose `Repository` and `Docs Folder` match the current workflow, builds a local path-to-page map, and syncs only pages whose source hash changed. A single Notion database can therefore store docs from multiple repositories or multiple docs folders without one sync run archiving another repo's pages. When a new database item is created, the row is created before the Markdown blocks are uploaded, so later workflow runs can find it even if the previous run failed after item creation.
 
-If a database row does not exist yet, the action first tries to match an existing database item by the generated Notion page title inside the same `Repository` and `Docs Folder` scope. Matching only happens for unique titles; duplicate titles are ignored to avoid attaching a Markdown file to the wrong page.
+If several rows share the same `Path`, the action keeps the oldest row by `created_time` (page id breaks ties) and logs a warning that lists the extra rows. It does not archive those extras unless `archive_duplicate_pages` is `true`. Before creating a row, it queries Notion again for that path and reuses the oldest existing row. A block-level Notion error such as `Can't edit block that is archived` retries the page update or fails that file; it does not create a replacement row while the original page still exists.
+
+If a database row does not exist yet, the action queries by `Path` before creating one. When that query is empty, it tries to match an existing database item by the generated Notion page title inside the same `Repository` and `Docs Folder` scope. Title matching only happens for unique titles; duplicate titles are ignored to avoid attaching a Markdown file to the wrong page.
 
 Legacy parent-page mode still stores sync state inside a child page named `_Markdown to Notion Sync Data (do not edit)`.
 
@@ -252,6 +256,8 @@ If the GitHub API lookup is unavailable, it falls back to local `git log`, which
 - Pages are skipped when the source hash is unchanged.
 - Pages are also skipped when Notion is newer than the last Git commit time.
 - If a Markdown path is renamed or deleted, the old Notion page is archived unless that same page ID is still referenced by another active Markdown file.
+- Duplicate rows for one path are left in place by default. Set `archive_duplicate_pages` to archive every row except the oldest.
+- A new database row is created only when that path has no live page. Block-level and transient Notion errors do not create a replacement page.
 - If a block append fails, the action logs a warning and continues.
 - HTML in Markdown is not preserved.
 

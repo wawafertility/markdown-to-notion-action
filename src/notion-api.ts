@@ -32,18 +32,67 @@ export function isNotionNotFoundError(error: unknown): boolean {
 }
 
 export function isNotionArchivedError(error: unknown): boolean {
-  if (!error || typeof error !== "object") {
+  if (!isNotionValidationError(error)) {
     return false;
+  }
+  const message = readNotionErrorMessage(error);
+  return message?.toLowerCase().includes("archived") ?? false;
+}
+
+export function isNotionBlockArchivedError(error: unknown): boolean {
+  const message = readNotionErrorMessage(error);
+  if (!message) {
+    return false;
+  }
+  const normalized = message.toLowerCase();
+  return normalized.includes("block") && normalized.includes("archived");
+}
+
+export function isTransientNotionError(error: unknown): boolean {
+  if (isRateLimitError(error)) {
+    return true;
   }
 
-  const errorDetails = error as { code?: string; message?: string };
-  if (errorDetails.code !== "validation_error") {
+  const errorDetails = readNotionErrorDetails(error);
+  if (!errorDetails) {
     return false;
   }
-  if (typeof errorDetails.message !== "string") {
-    return false;
+  if (
+    errorDetails.code !== undefined &&
+    [
+      "bad_gateway",
+      "conflict_error",
+      "gateway_timeout",
+      "internal_server_error",
+      "service_unavailable",
+    ].includes(errorDetails.code)
+  ) {
+    return true;
   }
-  return errorDetails.message.toLowerCase().includes("archived");
+  return (
+    errorDetails.status !== undefined && [409, 500, 502, 503, 504].includes(errorDetails.status)
+  );
+}
+
+function isNotionValidationError(error: unknown): boolean {
+  return readNotionErrorDetails(error)?.code === "validation_error";
+}
+
+function readNotionErrorMessage(error: unknown): string | null {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  const message = readNotionErrorDetails(error)?.message;
+  return typeof message === "string" ? message : null;
+}
+
+function readNotionErrorDetails(
+  error: unknown,
+): { code?: string; message?: string; status?: number } | null {
+  if (!error || typeof error !== "object") {
+    return null;
+  }
+  return error as { code?: string; message?: string; status?: number };
 }
 
 export function normalizeNotionId(input: string): string {

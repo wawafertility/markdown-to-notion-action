@@ -4,7 +4,13 @@ import * as core from "@actions/core";
 import { Client } from "@notionhq/client";
 
 import { appendBlocksSafe, appendPageLinksAfterAnchor } from "./block-sync.js";
-import { buildDatabasePageProperties, loadDatabaseSyncState } from "./database-sync-state.js";
+import {
+  buildDatabasePageProperties,
+  findCanonicalDatabasePageForPath,
+  formatDuplicatePathWarning,
+  listDuplicateRowsToArchive,
+  loadDatabaseSyncState,
+} from "./database-sync-state.js";
 import {
   buildBlocksForDocument,
   buildNotionPageTitle,
@@ -15,12 +21,7 @@ import {
 } from "./documents.js";
 import { createLogContext, describeError } from "./logging.js";
 import { appendSyncStateRecord, loadSyncState, writeSyncState } from "./notion-sync-state.js";
-import {
-  isNotionArchivedError,
-  isNotionNotFoundError,
-  normalizeNotionId,
-  notionPageUrl,
-} from "./notion-api.js";
+import { normalizeNotionId, notionPageUrl } from "./notion-api.js";
 import {
   archivePageIfPresent,
   createDataSourcePage,
@@ -29,18 +30,26 @@ import {
   resolveParentPageId,
   updateDataSourcePageContent,
   updateDataSourcePageProperties,
+  updateNotionPageWithRecovery,
   updatePageContent,
 } from "./page-sync.js";
 import { resolveInsideRoot } from "./path-utils.js";
 import {
+  isInputEnabled,
   normalizePrivateMarkdownPrefix,
   normalizeTitlePrefixSeparator,
   readInput,
 } from "./action-inputs.js";
-import type { DatabaseSyncState } from "./database-sync-state.js";
+import type {
+  DatabasePageCandidate,
+  DatabaseSyncState,
+  DuplicateDatabaseRow,
+} from "./database-sync-state.js";
+import type { LogContext } from "./logging.js";
 import type { MarkdownDocument, SyncStateEntry, SyncedPage } from "./sync-types.js";
 
 type RuntimeContext = {
+  archiveDuplicatePages: boolean;
   docsFolder: string;
   docsFolderPath: string;
   excludeGlobs: string[];
@@ -49,6 +58,14 @@ type RuntimeContext = {
   privateMarkdownPrefix: string | null;
   titlePrefixSeparator: string;
   workspaceRoot: string;
+};
+
+type ResolvedDatabaseShell = {
+  created: boolean;
+  pageId: string;
+  pageUrl: string;
+  sourceHash?: string;
+  title?: string;
 };
 
 async function run(): Promise<void> {
@@ -78,6 +95,9 @@ async function run(): Promise<void> {
       "TITLE_PREFIX_SEPARATOR",
     ]);
     const githubToken = readInput("github_token", ["GITHUB_TOKEN"]);
+    const archiveDuplicatePages = isInputEnabled(
+      readInput("archive_duplicate_pages", ["ARCHIVE_DUPLICATE_PAGES"]),
+    );
 
     core.setSecret(notionToken);
     if (githubToken) {
@@ -103,6 +123,7 @@ async function run(): Promise<void> {
     }
 
     const context: RuntimeContext = {
+      archiveDuplicatePages,
       docsFolder: docsFolderForSync,
       docsFolderPath,
       excludeGlobs,
@@ -112,6 +133,9 @@ async function run(): Promise<void> {
       titlePrefixSeparator: normalizeTitlePrefixSeparator(titlePrefixSeparatorInput),
       workspaceRoot,
     };
+    if (archiveDuplicatePages) {
+      core.info("Extra Notion rows for the same path will be archived.");
+    }
 
     if (databaseInput) {
       await syncDatabaseMode(context, databaseInput);
@@ -133,6 +157,18 @@ async function syncDatabaseMode(context: RuntimeContext, databaseInput: string):
     context.docsFolder,
     createLogContext("database"),
   );
+  if (context.archiveDuplicatePages && databaseState.duplicateRows.length > 0) {
+    const rowsToArchive = listDuplicateRowsToArchive(
+      databaseState.entries,
+      databaseState.duplicateRows,
+    );
+    if (rowsToArchive.length > 0) {
+      core.info(
+        `Archiving ${rowsToArchive.length} extra Notion database row(s) because archive_duplicate_pages is enabled.`,
+      );
+      await archiveDuplicateRows(context.notion, rowsToArchive);
+    }
+  }
   const documents = await loadDocuments(context, new Map());
   const knownPageUrls = buildKnownPageUrlsFromSyncEntries(
     context,
@@ -144,13 +180,7 @@ async function syncDatabaseMode(context: RuntimeContext, databaseInput: string):
   // content, so relative .md links can resolve to Notion URLs on first sync.
   for (const documentEntry of documents) {
     try {
-      await ensureDatabasePageExists(
-        context,
-        databaseState,
-        repo,
-        documentEntry,
-        knownPageUrls,
-      );
+      await ensureDatabasePageExists(context, databaseState, repo, documentEntry, knownPageUrls);
     } catch (error) {
       core.warning(
         `Failed to ensure Notion page for ${documentEntry.relPath}: ${describeError(error)}`,
@@ -198,6 +228,27 @@ async function ensureDatabasePageExists(
   let pageId = existingSyncStateEntry?.pageId ?? documentEntry.notionPageId;
 
   if (!pageId) {
+    const documentLog = createLogContext(documentEntry.relPath);
+    const found = await findRememberedDatabasePage(
+      context,
+      databaseState,
+      repo,
+      documentPath,
+      pageTitle,
+      documentLog,
+    );
+    if (found) {
+      databaseState.entries.set(documentPath, {
+        pageId: found.pageId,
+        sourceHash: found.sourceHash,
+        title: found.title,
+      });
+      knownPageUrls.set(documentEntry.absPath, found.pageUrl);
+      return;
+    }
+  }
+
+  if (!pageId) {
     const matchedPageId = databaseState.pageIdsByTitle.get(pageTitle);
     if (matchedPageId) {
       pageId = matchedPageId;
@@ -206,25 +257,24 @@ async function ensureDatabasePageExists(
 
   if (!pageId) {
     const documentLog = createLogContext(documentEntry.relPath);
-    const created = await createDataSourcePage(
-      context.notion,
-      databaseState.dataSourceId,
-      buildDatabasePageProperties(
-        databaseState.propertyNames,
-        repo,
-        context.docsFolder,
-        documentPath,
-        pageTitle,
-        undefined,
-      ),
+    const created = await createDatabasePageShell(
+      context,
+      databaseState,
+      repo,
+      documentPath,
+      pageTitle,
+      undefined,
+      documentLog,
     );
-    pageId = normalizeNotionId(created.id);
-    documentLog.info(`Created database page shell: ${pageTitle}`);
     databaseState.entries.set(documentPath, {
-      pageId,
-      title: pageTitle,
+      pageId: created.pageId,
+      sourceHash: created.created ? undefined : created.sourceHash,
+      title: created.title ?? pageTitle,
     });
-    knownPageUrls.set(documentEntry.absPath, created.url || notionPageUrl(pageId));
+    knownPageUrls.set(documentEntry.absPath, created.pageUrl);
+    if (created.created) {
+      documentLog.info(`Created database page shell: ${pageTitle}`);
+    }
     return;
   }
 
@@ -249,9 +299,30 @@ async function syncDocumentToDatabase(
 
   const documentPath = getDatabaseDocumentPath(context, documentEntry);
   const pageTitle = buildNotionPageTitle(documentEntry, context.titlePrefixSeparator);
-  const existingSyncStateEntry = databaseState.entries.get(documentPath);
+  let existingSyncStateEntry = databaseState.entries.get(documentPath);
   let pageId = existingSyncStateEntry?.pageId ?? documentEntry.notionPageId;
   let pageUrl = pageId ? notionPageUrl(pageId) : documentEntry.notionUrl;
+
+  if (!pageId) {
+    const found = await findRememberedDatabasePage(
+      context,
+      databaseState,
+      repo,
+      documentPath,
+      pageTitle,
+      documentLog,
+    );
+    if (found) {
+      pageId = found.pageId;
+      pageUrl = found.pageUrl;
+      databaseState.entries.set(documentPath, {
+        pageId: found.pageId,
+        sourceHash: found.sourceHash,
+        title: found.title,
+      });
+      existingSyncStateEntry = databaseState.entries.get(documentPath);
+    }
+  }
 
   if (!pageId) {
     const matchedPageId = databaseState.pageIdsByTitle.get(pageTitle);
@@ -288,26 +359,33 @@ async function syncDocumentToDatabase(
         documentLog.info("Skipping sync: Notion is up to date.");
         pageUrl ??= notionPageUrl(pageId);
       } else if (decision.archivedOrMissing) {
-        documentLog.warn(`Notion page missing or archived, recreating: ${pageTitle}`);
+        documentLog.warn(`Notion page missing or archived, recreating: ${pageTitle} (${pageId})`);
         pageId = undefined;
       } else {
-        try {
-          await updateDatabasePage(
-            context,
-            databaseState,
-            repo,
-            documentEntry,
-            pageTitle,
-            pageId,
-            knownPageUrls,
-          );
-          pageUrl = notionPageUrl(pageId);
+        const currentPageId = pageId;
+        const updateResult = await updateNotionPageWithRecovery(
+          context.notion,
+          currentPageId,
+          pageTitle,
+          documentLog,
+          () =>
+            updateDatabasePage(
+              context,
+              databaseState,
+              repo,
+              documentEntry,
+              pageTitle,
+              currentPageId,
+              knownPageUrls,
+            ),
+        );
+        if (updateResult === "updated") {
+          pageUrl = notionPageUrl(currentPageId);
           documentLog.info(`Updated page: ${pageTitle}`);
-        } catch (error) {
-          if (!isNotionArchivedError(error) && !isNotionNotFoundError(error)) {
-            throw error;
-          }
-          documentLog.warn(`Notion page missing or archived, recreating: ${pageTitle}`);
+        } else {
+          documentLog.warn(
+            `Notion page missing or archived, recreating: ${pageTitle} (${currentPageId})`,
+          );
           pageId = undefined;
         }
       }
@@ -400,20 +478,92 @@ async function createDatabasePage(
 ): Promise<{ pageId: string; pageUrl: string }> {
   const documentPath = getDatabaseDocumentPath(context, documentEntry);
   const documentLog = createLogContext(documentEntry.relPath);
-  const created = await createDataSourcePage(
+  const existingPage = await findCanonicalDatabasePageForPath(
     context.notion,
     databaseState.dataSourceId,
-    buildDatabasePageProperties(
-      databaseState.propertyNames,
+    databaseState.propertyNames,
+    repo,
+    context.docsFolder,
+    documentPath,
+  );
+  if (existingPage) {
+    documentLog.warn(
+      `Found existing Notion row for ${documentPath} before create. Updating ${existingPage.canonical.pageId} instead of creating a new page.`,
+    );
+    const adopted = await adoptDatabasePage(
+      context,
+      documentPath,
+      existingPage.canonical,
+      existingPage.extras,
+      documentLog,
+    );
+    const synced = await updateAdoptedDatabasePage(
+      context,
+      databaseState,
       repo,
-      context.docsFolder,
+      documentEntry,
+      documentPath,
+      pageTitle,
+      adopted,
+      knownPageUrls,
+      documentLog,
+    );
+    if (synced) {
+      return synced;
+    }
+    documentLog.warn(
+      `Notion page missing or archived, recreating: ${pageTitle} (${adopted.pageId})`,
+    );
+  }
+
+  let created = await createDatabasePageShell(
+    context,
+    databaseState,
+    repo,
+    documentPath,
+    pageTitle,
+    undefined,
+    documentLog,
+  );
+  if (!created.created) {
+    documentLog.warn(
+      `Using existing Notion row ${created.pageId} for ${documentPath} after a concurrent create.`,
+    );
+    const synced = await updateAdoptedDatabasePage(
+      context,
+      databaseState,
+      repo,
+      documentEntry,
+      documentPath,
+      pageTitle,
+      { pageId: created.pageId, pageUrl: created.pageUrl },
+      knownPageUrls,
+      documentLog,
+    );
+    if (synced) {
+      return synced;
+    }
+    documentLog.warn(
+      `Notion page missing or archived, recreating: ${pageTitle} (${created.pageId})`,
+    );
+    created = await createDatabasePageShell(
+      context,
+      databaseState,
+      repo,
       documentPath,
       pageTitle,
       undefined,
-    ),
-  );
-  const pageId = normalizeNotionId(created.id);
-  const pageUrl = created.url || notionPageUrl(pageId);
+      documentLog,
+    );
+    if (!created.created) {
+      throw new Error(
+        `Notion page ${created.pageId} for ${documentPath} disappeared while creating a replacement.`,
+      );
+    }
+  }
+
+  const pageId = created.pageId;
+  const pageUrl = created.pageUrl;
   documentLog.info(`Created database page: ${pageTitle}`);
   documentLog.info(`Page URL: ${pageUrl}`);
 
@@ -445,6 +595,198 @@ async function createDatabasePage(
     ),
   );
   return { pageId, pageUrl };
+}
+
+async function updateAdoptedDatabasePage(
+  context: RuntimeContext,
+  databaseState: DatabaseSyncState,
+  repo: string,
+  documentEntry: MarkdownDocument,
+  documentPath: string,
+  pageTitle: string,
+  page: { pageId: string; pageUrl: string },
+  knownPageUrls: Map<string, string>,
+  documentLog: LogContext,
+): Promise<{ pageId: string; pageUrl: string } | null> {
+  const updateResult = await updateNotionPageWithRecovery(
+    context.notion,
+    page.pageId,
+    pageTitle,
+    documentLog,
+    () =>
+      updateDatabasePage(
+        context,
+        databaseState,
+        repo,
+        documentEntry,
+        pageTitle,
+        page.pageId,
+        knownPageUrls,
+      ),
+  );
+  if (updateResult !== "updated") {
+    return null;
+  }
+  databaseState.entries.set(documentPath, {
+    pageId: page.pageId,
+    sourceHash: documentEntry.sourceHash,
+    title: pageTitle,
+  });
+  return page;
+}
+
+async function createDatabasePageShell(
+  context: RuntimeContext,
+  databaseState: DatabaseSyncState,
+  repo: string,
+  documentPath: string,
+  pageTitle: string,
+  sourceHash: string | undefined,
+  documentLog: LogContext,
+): Promise<ResolvedDatabaseShell> {
+  const created = await createDataSourcePage(
+    context.notion,
+    databaseState.dataSourceId,
+    buildDatabasePageProperties(
+      databaseState.propertyNames,
+      repo,
+      context.docsFolder,
+      documentPath,
+      pageTitle,
+      sourceHash,
+    ),
+  );
+  const createdPageId = normalizeNotionId(created.id);
+  const createdPageUrl = created.url || notionPageUrl(createdPageId);
+  const raced = await findCanonicalDatabasePageForPath(
+    context.notion,
+    databaseState.dataSourceId,
+    databaseState.propertyNames,
+    repo,
+    context.docsFolder,
+    documentPath,
+  );
+  if (raced && normalizeNotionId(raced.canonical.pageId) !== createdPageId) {
+    documentLog.warn(
+      `Notion row ${createdPageId} lost the create race for path "${documentPath}". Archiving it and using oldest row ${normalizeNotionId(raced.canonical.pageId)}.`,
+    );
+    await archivePageIfPresent(context.notion, createdPageId, documentLog);
+    const extras = raced.extras.filter(
+      (extra) => normalizeNotionId(extra.pageId) !== createdPageId,
+    );
+    await warnAndMaybeArchiveExtras(context, documentPath, raced.canonical, extras, documentLog);
+    return {
+      created: false,
+      pageId: normalizeNotionId(raced.canonical.pageId),
+      pageUrl: raced.canonical.url || notionPageUrl(raced.canonical.pageId),
+      sourceHash: raced.canonical.sourceHash,
+      title: raced.canonical.title,
+    };
+  }
+
+  if (raced && raced.extras.length > 0) {
+    await warnAndMaybeArchiveExtras(
+      context,
+      documentPath,
+      raced.canonical,
+      raced.extras,
+      documentLog,
+    );
+  }
+  return {
+    created: true,
+    pageId: createdPageId,
+    pageUrl: createdPageUrl,
+    title: pageTitle,
+  };
+}
+
+async function findRememberedDatabasePage(
+  context: RuntimeContext,
+  databaseState: DatabaseSyncState,
+  repo: string,
+  documentPath: string,
+  pageTitle: string,
+  documentLog: LogContext,
+): Promise<{ pageId: string; pageUrl: string; sourceHash?: string; title?: string } | null> {
+  const existingPage = await findCanonicalDatabasePageForPath(
+    context.notion,
+    databaseState.dataSourceId,
+    databaseState.propertyNames,
+    repo,
+    context.docsFolder,
+    documentPath,
+  );
+  if (!existingPage) {
+    return null;
+  }
+
+  documentLog.info(
+    `Found existing Notion row for ${documentPath} before create. Using oldest page ${existingPage.canonical.pageId}.`,
+  );
+  const adopted = await adoptDatabasePage(
+    context,
+    documentPath,
+    existingPage.canonical,
+    existingPage.extras,
+    documentLog,
+  );
+  return {
+    pageId: adopted.pageId,
+    pageUrl: adopted.pageUrl,
+    sourceHash: existingPage.canonical.sourceHash,
+    title: existingPage.canonical.title ?? pageTitle,
+  };
+}
+
+async function adoptDatabasePage(
+  context: RuntimeContext,
+  documentPath: string,
+  canonical: DatabasePageCandidate,
+  extras: DatabasePageCandidate[],
+  documentLog: LogContext,
+): Promise<{ pageId: string; pageUrl: string }> {
+  await warnAndMaybeArchiveExtras(context, documentPath, canonical, extras, documentLog);
+  const pageId = normalizeNotionId(canonical.pageId);
+  return { pageId, pageUrl: canonical.url || notionPageUrl(pageId) };
+}
+
+async function warnAndMaybeArchiveExtras(
+  context: RuntimeContext,
+  documentPath: string,
+  canonical: DatabasePageCandidate,
+  extras: DatabasePageCandidate[],
+  documentLog: LogContext,
+): Promise<void> {
+  if (extras.length === 0) {
+    return;
+  }
+  documentLog.warn(formatDuplicatePathWarning(documentPath, canonical, extras));
+  if (!context.archiveDuplicatePages) {
+    return;
+  }
+  const rows: DuplicateDatabaseRow[] = extras.map((extra) => ({
+    ...extra,
+    path: documentPath,
+  }));
+  await archiveDuplicateRows(
+    context.notion,
+    listDuplicateRowsToArchive(new Map([[documentPath, { pageId: canonical.pageId }]]), rows),
+  );
+}
+
+async function archiveDuplicateRows(notion: Client, rows: DuplicateDatabaseRow[]): Promise<void> {
+  const concurrency = 3;
+  for (let index = 0; index < rows.length; index += concurrency) {
+    const chunk = rows.slice(index, index + concurrency);
+    await Promise.all(
+      chunk.map(async (row) => {
+        const rowLog = createLogContext(row.path);
+        rowLog.warn(`Archiving extra Notion row ${row.pageId} for path "${row.path}".`);
+        await archivePageIfPresent(notion, row.pageId, rowLog);
+      }),
+    );
+  }
 }
 
 async function syncPageMode(
@@ -569,27 +911,35 @@ async function syncDocumentToPage(
         documentLog.info("Skipping sync: Notion is up to date.");
         pageUrl ??= notionPageUrl(pageId);
       } else if (decision.archivedOrMissing) {
-        documentLog.warn(`Notion page missing or archived, recreating: ${pageTitle}`);
+        documentLog.warn(`Notion page missing or archived, recreating: ${pageTitle} (${pageId})`);
         pageId = undefined;
       } else {
-        try {
-          const blocks = await buildBlocksForDocument(
-            context.notion,
-            documentEntry,
-            context.docsFolderPath,
-            context.workspaceRoot,
-            knownPageUrls,
-            context.githubToken,
-            documentLog,
-          );
-          await updatePageContent(context.notion, pageId, pageTitle, blocks, documentLog);
-          pageUrl = notionPageUrl(pageId);
+        const currentPageId = pageId;
+        const updateResult = await updateNotionPageWithRecovery(
+          context.notion,
+          currentPageId,
+          pageTitle,
+          documentLog,
+          async () => {
+            const blocks = await buildBlocksForDocument(
+              context.notion,
+              documentEntry,
+              context.docsFolderPath,
+              context.workspaceRoot,
+              knownPageUrls,
+              context.githubToken,
+              documentLog,
+            );
+            await updatePageContent(context.notion, currentPageId, pageTitle, blocks, documentLog);
+          },
+        );
+        if (updateResult === "updated") {
+          pageUrl = notionPageUrl(currentPageId);
           documentLog.info(`Updated page: ${pageTitle}`);
-        } catch (error) {
-          if (!isNotionArchivedError(error) && !isNotionNotFoundError(error)) {
-            throw error;
-          }
-          documentLog.warn(`Notion page missing or archived, recreating: ${pageTitle}`);
+        } else {
+          documentLog.warn(
+            `Notion page missing or archived, recreating: ${pageTitle} (${currentPageId})`,
+          );
           pageId = undefined;
         }
       }
